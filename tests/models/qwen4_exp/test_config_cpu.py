@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -66,6 +67,8 @@ def _vllm_config(restriction: str | None = None) -> SimpleNamespace:
     )
     if restriction == "multimodal":
         config.model_config.multimodal_config.language_model_only = False
+    if restriction in ("mtp", "ngram"):
+        config.speculative_config = SimpleNamespace(method=restriction)
     return config
 
 
@@ -76,12 +79,14 @@ def _vllm_config(restriction: str | None = None) -> SimpleNamespace:
         ("multimodal", NotImplementedError, "text-only"),
         ("model_runner", ValueError, "Model Runner V2"),
         ("triton", ValueError, "active CPU backend"),
+        ("ngram", NotImplementedError, "native MTP"),
+        ("mtp", None, None),
     ],
 )
 def test_qwen4_exp_cpu_rejects_unsupported_runtime(
     restriction: str,
-    error: type[Exception],
-    message: str,
+    error: type[Exception] | None,
+    message: str | None,
 ) -> None:
     cpu_arch = CpuArchEnum.ARM if restriction == "architecture" else CpuArchEnum.X86
     with (
@@ -100,11 +105,58 @@ def test_qwen4_exp_cpu_rejects_unsupported_runtime(
             "has_active_triton_cpu_backend",
             return_value=restriction != "triton",
         ),
-        pytest.raises(error, match=message),
+        pytest.raises(error, match=message) if error else nullcontext(),
     ):
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(
             _vllm_config(restriction)
         )
+
+
+def test_qwen4_exp_cpu_mtp_adds_embedding_to_every_branch() -> None:
+    """The CPU decoder layer ignores prev_block_output without an injection,
+    so the drafter must fold the embedding residual into the input itself."""
+    from vllm.models.qwen4_exp.cpu import mtp as cpu_mtp
+
+    model = object.__new__(cpu_mtp.Qwen4ExpMultiTokenPredictor)
+    nn.Module.__init__(model)
+    model.hc_count = 2
+    model.hidden_size = 4
+    model.num_mtp_layers = 1
+    model.pre_fc_norm_embedding = nn.Identity()
+    model.fc_embedding = nn.Identity()
+    model.pre_fc_norm_hidden = nn.Identity()
+    model.fc_hidden = nn.Identity()
+    layer_inputs = {}
+
+    def layer(**kwargs):
+        layer_inputs.update(kwargs)
+        hidden_states = kwargs["hidden_states"]
+        return hidden_states, hidden_states, None
+
+    model.layers = [layer]
+    model.hyper_connection_mixer = SimpleNamespace(
+        combine_and_mix=lambda hidden_states, block_output, injection: (
+            hidden_states,
+            hidden_states.unflatten(-1, (2, 4)).sum(-2),
+            None,
+        ),
+    )
+    backbone = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    embeds = torch.full((2, 4), 100.0)
+    pp_group = SimpleNamespace(is_first_rank=True, is_last_rank=True)
+
+    with patch.object(cpu_mtp, "get_pp_group", return_value=pp_group):
+        _, multi_hidden = model.forward(
+            input_ids=None,
+            positions=torch.arange(2),
+            hidden_states=backbone,
+            inputs_embeds=embeds,
+        )
+
+    expected = (backbone.unflatten(-1, (2, 4)) + embeds.unsqueeze(-2)).flatten(-2)
+    torch.testing.assert_close(layer_inputs["hidden_states"], expected)
+    assert layer_inputs["prev_block_output"] is None
+    torch.testing.assert_close(multi_hidden, expected)
 
 
 def _block_fp8_config() -> SimpleNamespace:

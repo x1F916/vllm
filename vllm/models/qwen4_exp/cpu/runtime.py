@@ -28,9 +28,11 @@ def verify_cpu_config(vllm_config: "VllmConfig") -> None:
     """Reject runtime configurations unsupported by Qwen4Exp on CPU."""
     if current_platform.get_cpu_architecture() != CpuArchEnum.X86:
         raise NotImplementedError("Qwen4Exp CPU support currently requires x86-64.")
-    if vllm_config.speculative_config is not None:
+    spec_config = vllm_config.speculative_config
+    if spec_config is not None and spec_config.method != "mtp":
         raise NotImplementedError(
-            "Qwen4Exp CPU support does not yet support speculative decoding."
+            "Qwen4Exp CPU speculative decoding supports only the native MTP "
+            f"checkpoint, got method={spec_config.method!r}."
         )
     if vllm_config.lora_config is not None:
         raise NotImplementedError("Qwen4Exp CPU support does not yet support LoRA.")
