@@ -181,10 +181,15 @@ inline __attribute__((always_inline)) __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
   vsign = _mm512_slli_epi16(vsign, 8);
 
   __m512i vexp_and_mant = _mm512_and_si512(x, mask1);
+  // The fixed exponent bit below would turn +-0 into 2^-7 (before the
+  // kFP8_BIAS rescale), so zero lanes are cleared explicitly. Subnormals stay
+  // approximate.
+  const __mmask32 nonzero = _mm512_test_epi16_mask(x, mask1);
   vexp_and_mant = _mm512_slli_epi16(vexp_and_mant, 4);
 
   // _MM_TERNLOG_A | _MM_TERNLOG_B | _MM_TERNLOG_C: 0b11111110
-  return (__m512bh)(_mm512_ternarylogic_epi32(vsign, mask2, vexp_and_mant, 0b11111110));
+  return (__m512bh)_mm512_maskz_mov_epi16(
+      nonzero, _mm512_ternarylogic_epi32(vsign, mask2, vexp_and_mant, 0b11111110));
 }
 
 // bias for conversion of fp8 to bf16 1/256 in float32
