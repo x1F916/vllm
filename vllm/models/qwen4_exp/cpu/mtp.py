@@ -57,6 +57,7 @@ from .model import (
     Qwen4ExpMixtureOfExperts,
     Qwen4ExpSparseMoeBlock,
     _pad_moe_checkpoint_weights,
+    fuse_moe_input_projections,
 )
 
 
@@ -369,7 +370,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             self,
             ignore_unexpected_suffixes=_QWEN4_EXP_IGNORED_MISSING_SUFFIXES.copy(),
         )
-        return loader.load_weights(weights, mapper=mapper)
+        return fuse_moe_input_projections(
+            self, loader.load_weights(weights, mapper=mapper)
+        )
 
 
 @support_torch_compile(

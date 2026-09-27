@@ -14,9 +14,13 @@ from torch import nn
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-from vllm.distributed import get_pp_group
+from vllm.distributed import get_pp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe.utils import (
     is_model_fused_shared_expert_compatible,
+)
+from vllm.model_executor.layers.linear import (
+    ReplicatedLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
@@ -302,6 +306,99 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
                 self.original_intermediate_size_per_partition
             )
         self.n_shared_experts = int(config.shared_expert_intermediate_size > 0)
+
+        # The router, the shared expert's gate_up and its sigmoid gate all read
+        # the same input. At decode sizes three narrow BF16 GEMMs cost mostly
+        # launch overhead, so run them as one GEMM over the concatenated
+        # weights (filled by fuse_input_projections after loading).
+        self.fused_in_proj: ReplicatedLinear | None = None
+        if self._can_fuse_input_projections():
+            assert self.shared_expert is not None
+            self._fused_in_sizes = [
+                self.gate.output_size,
+                self.shared_expert.gate_up_proj.output_size_per_partition,
+                self.shared_expert_gate.output_size,
+            ]
+            self.fused_in_proj = ReplicatedLinear(
+                config.hidden_size,
+                sum(self._fused_in_sizes),
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.fused_in_proj",
+            )
+            # The runner now gets precomputed router logits and no shared
+            # expert, and returns its partial sum; forward() adds the shared
+            # expert and does the single TP all-reduce.
+            runner = self.experts
+            runner.gate = None
+            runner._shared_experts = None
+            runner._forward_entry = runner._select_forward()
+            runner.moe_config.skip_final_all_reduce = True
+
+    def _can_fuse_input_projections(self) -> bool:
+        if (
+            getattr(self, "shared_expert", None) is None
+            or self.replicate_shared_expert
+            or self.is_sequence_parallel
+        ):
+            return False
+        layers = (self.gate, self.shared_expert.gate_up_proj, self.shared_expert_gate)
+        return all(
+            isinstance(layer.quant_method, UnquantizedLinearMethod) for layer in layers
+        )
+
+    def fuse_input_projections(self) -> None:
+        """Concatenate the loaded input projections into ``fused_in_proj``."""
+        if self.fused_in_proj is None:
+            return
+        assert self.shared_expert is not None
+        layers = (self.gate, self.shared_expert.gate_up_proj, self.shared_expert_gate)
+        self.fused_in_proj.weight.data.copy_(
+            torch.cat([layer.weight.data for layer in layers], dim=0)
+        )
+        for layer in layers:
+            # Unused from now on; drop the storage and skip CPU GEMM packing.
+            layer.weight = nn.Parameter(
+                torch.empty_like(layer.weight, device="meta"), requires_grad=False
+            )
+            layer._cpu_skip_gemm_dispatch = True
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        already_sequence_parallel: bool = False,
+    ) -> torch.Tensor:
+        if self.fused_in_proj is None:
+            return super().forward(hidden_states, already_sequence_parallel)
+        assert self.shared_expert is not None
+        orig_shape = hidden_states.shape
+        hidden_states = hidden_states.view(-1, orig_shape[-1])
+        fused, _ = self.fused_in_proj(hidden_states)
+        router_logits, gate_up, shared_gate = fused.split(self._fused_in_sizes, dim=-1)
+        shared_output, _ = self.shared_expert.down_proj(
+            self.shared_expert.act_fn(gate_up)
+        )
+        shared_output = torch.sigmoid(shared_gate) * shared_output
+        routed_output = self.experts(
+            hidden_states=hidden_states, router_logits=router_logits
+        )
+        # Same order as the runner: shared + routed, then one all-reduce.
+        final_hidden_states = shared_output + routed_output
+        if self.tp_size > 1:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        return final_hidden_states.view(orig_shape)
+
+
+def fuse_moe_input_projections(model: nn.Module, loaded: set[str]) -> set[str]:
+    """Build every fused MoE input projection and mark it loaded."""
+    for name, module in model.named_modules():
+        if (
+            isinstance(module, Qwen4ExpSparseMoeBlock)
+            and module.fused_in_proj is not None
+        ):
+            module.fuse_input_projections()
+            loaded.add(f"{name}.fused_in_proj.weight")
+    return loaded
 
 
 class Qwen4ExpDecoderLayer(nn.Module):
@@ -725,7 +822,7 @@ class Qwen4ExpModel(nn.Module):
             weights,
             mapper=mapper,
         )
-        return loaded
+        return fuse_moe_input_projections(self, loaded)
 
 
 class Qwen4ExpForCausalLM(
