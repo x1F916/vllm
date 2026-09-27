@@ -373,6 +373,64 @@ inline void parallel_2d_tiled(int m, int n, int nth_m, int nth_n, const func_t& 
 #endif
 }
 
+// Like parallel_2d, but when m is small (e.g. MoE decode with a few expert
+// blocks) the square-ish split can leave some threads with far more blocks
+// than others. Pick the nth_m x nth_n split (using at most all threads, odd
+// counts allowed) that minimizes the largest per-thread block count, and fall
+// back to the parallel_2d split unless it is strictly better. Each (m, n)
+// block is still computed by exactly one thread, so results are unchanged.
+template <typename func_t>
+inline void parallel_2d_balanced(int m, int n, const func_t& f) {
+  if (m <= 0 || n <= 0) {
+    return;
+  }
+  int nth = adjust_num_threads(m);
+  int nth_m = std::ceil(std::sqrt(float(m) / n * nth));
+  int nth_n = 1;
+  for (; nth_m > 0; --nth_m) {
+    nth_n = nth / nth_m;
+    if (nth_m * nth_n == nth) {
+      break;
+    }
+  }
+  int best_cost = div_up(m, nth_m) * div_up(n, nth_n);
+
+  const int max_nth = at::get_num_threads();
+  for (int tm = 1; tm <= std::min(m, max_nth); ++tm) {
+    for (int tn = 1; tn <= std::min(n, max_nth / tm); ++tn) {
+      int cost = div_up(m, tm) * div_up(n, tn);
+      if (cost < best_cost ||
+          (cost == best_cost && tm * tn < nth_m * nth_n)) {
+        best_cost = cost;
+        nth_m = tm;
+        nth_n = tn;
+      }
+    }
+  }
+
+  // Keep the full thread team; resizing it between regions is costly. The
+  // team may still be smaller than planned (nested region, OMP_DYNAMIC), so
+  // threads stride over the tiles instead of taking one tile each.
+#if defined(_OPENMP)
+#pragma omp parallel
+  {
+    const int thread_block_m = div_up(m, nth_m);
+    const int thread_block_n = div_up(n, nth_n);
+    for (int t = omp_get_thread_num(); t < nth_m * nth_n; t += omp_get_num_threads()) {
+      int ith_m = t / nth_n;
+      int ith_n = t % nth_n;
+      int begin_m = std::min(ith_m * thread_block_m, m);
+      int end_m = std::min(begin_m + thread_block_m, m);
+      int begin_n = std::min(ith_n * thread_block_n, n);
+      int end_n = std::min(begin_n + thread_block_n, n);
+      f(begin_m, end_m, begin_n, end_n);
+    }
+  }
+#else
+  f(0, m, 0, n);
+#endif
+}
+
 // limit max cache blocks
 // when we need to do pre-unpack for weights, e.g. fp8
 #define MAX_CACHE_BLOCK_SIZE 4
