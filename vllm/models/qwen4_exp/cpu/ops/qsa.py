@@ -13,6 +13,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 
 from ..runtime import has_active_triton_cpu_backend
+from .launch import grid_num_threads, launch
 
 _MAX_GRID_AXIS = 65_535
 _LOGITS_WORKSPACE_BYTES = 128 * 1024 * 1024
@@ -436,6 +437,52 @@ def _store_qsa_rows_kernel(
 
 
 @triton.jit
+def _store_qsa_kv_kernel(
+    cache_ptr,
+    slots_ptr,
+    key_ptr,
+    value_ptr,
+    stride_cache_block,
+    stride_cache_head,
+    stride_cache_token,
+    stride_key_row,
+    stride_key_head,
+    stride_value_row,
+    stride_value_head,
+    num_blocks,
+    PAGE_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    dims = tl.arange(0, BLOCK_D)
+    slot = tl.load(slots_ptr + row)
+    valid = (slot >= 0) & (slot < num_blocks * PAGE_SIZE)
+    mask = valid & (dims < HEAD_DIM)
+    safe_slot = tl.maximum(slot, 0)
+    dst = (
+        cache_ptr
+        + (safe_slot // PAGE_SIZE).to(tl.int64) * stride_cache_block
+        + head * stride_cache_head
+        + (safe_slot % PAGE_SIZE) * stride_cache_token
+        + dims
+    )
+    key = tl.load(
+        key_ptr + row * stride_key_row + head * stride_key_head + dims,
+        mask=mask,
+        other=0,
+    )
+    value = tl.load(
+        value_ptr + row * stride_value_row + head * stride_value_head + dims,
+        mask=mask,
+        other=0,
+    )
+    tl.store(dst, key, mask=mask)
+    tl.store(dst + HEAD_DIM, value, mask=mask)
+
+
+@triton.jit
 def _compress_qsa_groups_kernel(
     raw_keys_ptr,
     raw_positions_ptr,
@@ -637,7 +684,10 @@ def qsa_mqa_paged(
     if not q.shape[0] or not columns:
         return logits, visible_blocks
     block_n = 32
-    _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
+    grid = (q.shape[0], triton.cdiv(columns, block_n))
+    launch(
+        _qsa_mqa_paged_kernel,
+        grid,
         q,
         k_cache,
         page_table,
@@ -667,7 +717,7 @@ def qsa_mqa_paged(
         BLOCK_N=block_n,
         BLOCK_D=triton.next_power_of_2(q.shape[2]),
         COMPRESS_RATIO=compress_ratio,
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return logits, visible_blocks
 
@@ -718,9 +768,10 @@ def expand_qsa_block_indices(
     if not block_indices.shape[0]:
         return out
     column_block = 256
-    _expand_qsa_indices_kernel[
-        (block_indices.shape[0], triton.cdiv(output_width, column_block))
-    ](
+    grid = (block_indices.shape[0], triton.cdiv(output_width, column_block))
+    launch(
+        _expand_qsa_indices_kernel,
+        grid,
         block_indices,
         query_positions,
         sequence_lengths,
@@ -736,7 +787,7 @@ def expand_qsa_block_indices(
         COMPRESS_RATIO=compress_ratio,
         OUTPUT_WIDTH=output_width,
         COLUMN_BLOCK=column_block,
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return out
 
@@ -956,7 +1007,9 @@ def qsa_sparse_paged_attention(
             device=q.device,
         )
 
-    _qsa_sparse_paged_gqa_splitk_kernel[(q.shape[0], k_cache.shape[2], num_splits)](
+    launch(
+        _qsa_sparse_paged_gqa_splitk_kernel,
+        (q.shape[0], k_cache.shape[2], num_splits),
         q,
         k_cache,
         v_cache,
@@ -996,7 +1049,10 @@ def qsa_sparse_paged_attention(
     if num_splits == 1:
         return out
 
-    _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
+    grid = (q.shape[0], q.shape[1])
+    launch(
+        _qsa_merge_splitk_kernel,
+        grid,
         partial_output,
         partial_lse,
         out,
@@ -1007,7 +1063,7 @@ def qsa_sparse_paged_attention(
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return out
 
@@ -1038,7 +1094,10 @@ def qsa_store_cache_rows(
         raise ValueError("QSA cache-store row dimensions must be contiguous")
     if not rows.shape[0]:
         return
-    _store_qsa_rows_kernel[(rows.shape[0],)](
+    grid = (rows.shape[0],)
+    launch(
+        _store_qsa_rows_kernel,
+        grid,
         cache,
         slot_mapping,
         rows,
@@ -1052,7 +1111,51 @@ def qsa_store_cache_rows(
         PAGE_SIZE=cache.shape[1],
         WIDTH=cache.shape[3],
         BLOCK_D=triton.next_power_of_2(cache.shape[3]),
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
+    )
+
+
+def qsa_store_kv(
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> None:
+    """Store K/V rows into a ``[blocks, heads, page, 2 * head_dim]`` cache.
+
+    Rows whose slot is negative (padding) are skipped.
+    """
+    num_rows, num_heads, head_dim = key.shape
+    if value.shape != key.shape or slot_mapping.shape != (num_rows,):
+        raise ValueError("QSA K/V rows and slots have incompatible shapes")
+    if kv_cache.shape[1] != num_heads or kv_cache.shape[3] != 2 * head_dim:
+        raise ValueError("QSA K/V cache and rows have incompatible shapes")
+    if key.dtype != kv_cache.dtype or value.dtype != kv_cache.dtype:
+        raise ValueError("QSA K/V rows must match the cache dtype")
+    if kv_cache.stride(3) != 1 or key.stride(2) != 1 or value.stride(2) != 1:
+        raise ValueError("QSA K/V head dimensions must be contiguous")
+    if not num_rows:
+        return
+    grid = (num_rows, num_heads)
+    launch(
+        _store_qsa_kv_kernel,
+        grid,
+        kv_cache,
+        slot_mapping,
+        key,
+        value,
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        key.stride(0),
+        key.stride(1),
+        value.stride(0),
+        value.stride(1),
+        kv_cache.shape[0],
+        PAGE_SIZE=kv_cache.shape[2],
+        HEAD_DIM=head_dim,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        num_cpu_threads=grid_num_threads(*grid),
     )
 
 
@@ -1125,7 +1228,10 @@ def qsa_compress_groups_with_ratio(
     first_positions = torch.empty((rows, 3), dtype=torch.int64, device=raw_keys.device)
     if not rows:
         return pooled, first_positions
-    _compress_qsa_groups_kernel[(rows,)](
+    grid = (rows,)
+    launch(
+        _compress_qsa_groups_kernel,
+        grid,
         raw_keys,
         raw_positions,
         compressor_state_cache,
@@ -1155,7 +1261,7 @@ def qsa_compress_groups_with_ratio(
         COMPRESS_RATIO=compress_ratio,
         HEAD_DIM=raw_keys.shape[2],
         BLOCK_D=triton.next_power_of_2(raw_keys.shape[2]),
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return pooled, first_positions
 
@@ -1167,4 +1273,5 @@ __all__ = [
     "qsa_select_paged_tokens",
     "qsa_sparse_paged_attention",
     "qsa_store_cache_rows",
+    "qsa_store_kv",
 ]

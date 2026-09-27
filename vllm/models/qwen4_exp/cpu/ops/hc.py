@@ -10,6 +10,8 @@ import torch
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from .launch import grid_num_threads, launch
+
 
 @triton.jit
 def _grouped_gemma_rmsnorm_kernel(
@@ -52,7 +54,10 @@ def _grouped_gemma_rmsnorm(
     assert weight.numel() in (group_dim, DIM)
 
     y = x.new_empty(x.shape)
-    _grouped_gemma_rmsnorm_kernel[(N * num_groups,)](
+    grid = (N * num_groups,)
+    launch(
+        _grouped_gemma_rmsnorm_kernel,
+        grid,
         x,
         weight,
         y,
@@ -62,7 +67,7 @@ def _grouped_gemma_rmsnorm(
         num_groups,
         W_SHARED=weight.numel() == group_dim,
         EPS=eps,
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return y
 
@@ -89,14 +94,17 @@ def _hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
     num_tokens, DIM = x.shape
     assert x.stride(1) == 1
     output = x.new_empty(x.shape)
-    _hc_silu_kernel[(num_tokens,)](
+    grid = (num_tokens,)
+    launch(
+        _hc_silu_kernel,
+        grid,
         x,
         output,
         x.stride(0),
         output.stride(0),
         DIM=DIM,
         HC=hc_count,
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return output
 
@@ -137,7 +145,10 @@ def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Te
     HC_DIM = DIM // hc_count
     out = x.new_empty(N, HC_DIM)
     BLOCK_SIZE = 512
-    _hc_gate_mix_kernel[(N, triton.cdiv(HC_DIM, BLOCK_SIZE))](
+    grid = (N, triton.cdiv(HC_DIM, BLOCK_SIZE))
+    launch(
+        _hc_gate_mix_kernel,
+        grid,
         x,
         gate,
         out,
@@ -147,7 +158,7 @@ def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Te
         DIM,
         hc_count,
         BLOCK_SIZE,
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return out
 
@@ -207,7 +218,10 @@ def _hc_combine(
 
     out = residual.new_empty(residual.shape)
     BLOCK_SIZE = 512
-    _hc_combine_kernel[(N, triton.cdiv(hc_dim, BLOCK_SIZE))](
+    grid = (N, triton.cdiv(hc_dim, BLOCK_SIZE))
+    launch(
+        _hc_combine_kernel,
+        grid,
         block_output,
         residual,
         injection_logits,
@@ -219,7 +233,7 @@ def _hc_combine(
         hc_dim,
         hc_count,
         BLOCK_SIZE,
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return out
 
@@ -303,7 +317,10 @@ def _hc_combine_norm(
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
     BLOCK_SIZE = 512
-    _hc_combine_norm_kernel[(N, hc_count)](
+    grid = (N, hc_count)
+    launch(
+        _hc_combine_norm_kernel,
+        grid,
         block_output,
         residual,
         injection_logits,
@@ -320,7 +337,7 @@ def _hc_combine_norm(
         W_SHARED=norm_weight.numel() == hc_dim,
         EPS=eps,
         BLOCK_SIZE=BLOCK_SIZE,
-        num_cpu_threads=0,
+        num_cpu_threads=grid_num_threads(*grid),
     )
     return out, y
 
