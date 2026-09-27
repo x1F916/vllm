@@ -1050,10 +1050,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             device=hidden_states.device,
         )
 
+        # The CPU conv and gating kernels read dense rows. Copying here keeps
+        # the copies in the compiled graph instead of eager ops inside the op.
         torch.ops.vllm.cpu_gdn_attention_core(
-            mixed_qkv,
-            b,
-            a,
+            mixed_qkv.contiguous(),
+            b.contiguous(),
+            a.contiguous(),
             core_attn_out,
             _encode_layer_name(self.prefix),
         )
