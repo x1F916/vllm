@@ -125,14 +125,16 @@ void fused_experts_fp_kernel_impl(
   });
 
   // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
+  // At decode sizes this is a few thousand elements; keep it on this thread.
+  const int64_t act_grain_size = div_up(int64_t(16 * GRAIN_SIZE), N);
   if (act_func == CPUActMethod::silu_and_mul) {
-    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+    at::parallel_for(0, M * topk, act_grain_size, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
       }
     });
   } else if (act_func == CPUActMethod::swiglu) {
-    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+    at::parallel_for(0, M * topk, act_grain_size, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         clamp_sigmoid_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, N / 2, alpha, limit);
         clamp_sigmoid_and_mul_stub(ic1 + m * N + N / 2, ic0 + m * 2 * N + N, N / 2, alpha, limit);

@@ -44,8 +44,13 @@ int moe_align_block_size(
     int num_threads) {
 #define T_INDEX(tt) total_cnts + (tt) * num_experts
 
+  // Decode routes only a few tokens; below GRAIN_SIZE both loops run on the
+  // calling thread instead of paying an OpenMP fork/join. They must use the
+  // same grain so that each thread scatters the ids it counted.
+  const int grain_size = GRAIN_SIZE;
+
   // accumulate count of expert ids locally
-  at::parallel_for(0, numel, 0, [&](int begin, int end) {
+  at::parallel_for(0, numel, grain_size, [&](int begin, int end) {
     int tid = at::get_thread_num();
     int32_t* __restrict__ local_cnts = T_INDEX(tid + 1);
 
@@ -74,7 +79,7 @@ int moe_align_block_size(
   }
   int num_tokens_post_pad = cumsums[num_experts];
 
-  at::parallel_for(0, numel, 0, [&](int begin, int end) {
+  at::parallel_for(0, numel, grain_size, [&](int begin, int end) {
     int tid = at::get_thread_num();
     // thread tid offsets in `total_cnts`
     int32_t* __restrict__ offsets = T_INDEX(tid);
@@ -974,14 +979,17 @@ void fused_experts_cpu(
   // init sorted_ids with `numel` as the padding number
   // init expert_ids with `num_experts`
   int64_t numel = M * topk;
-  at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
+  // Both fills below touch a few hundred KB at most, which one thread does
+  // faster than an OpenMP fork/join over the whole team.
+  constexpr int64_t SMALL_FILL_SIZE = 64 * 1024;
+  at::parallel_for(0, max_num_blocks, SMALL_FILL_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
     int64_t m_start = begin * BLOCK_M;
     int64_t m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
     fill_stub(sorted_ids + m_start, (int32_t)numel, m_size);
     fill_stub(expert_ids + begin, (int32_t)E, end - begin);
   });
   // zero total_cnts and cumsums
-  at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, (num_threads + 1) * E + (E + 1), SMALL_FILL_SIZE, [&](int64_t begin, int64_t end) {
     fill_stub(total_cnts + begin, 0, end - begin);
   });
 
