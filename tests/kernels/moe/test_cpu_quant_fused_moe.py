@@ -176,6 +176,43 @@ FP8_MOE_CONFIGS = [
 ]
 
 
+@pytest.mark.parametrize("M", [1, 4, 64])
+@pytest.mark.parametrize("N,K", [(320, 2560), (192, 512)])
+@pytest.mark.parametrize("block_size", [[64, 64], [32, 32]])
+def test_w8a16_refined_block_fp8_cpu_fused_moe(M, N, K, block_size):
+    """Refined FP8 blocks (a TP shard that splits a 128x128 checkpoint block)
+    must match the dequantised reference on both the small-M and brgemm paths.
+    """
+    set_random_seed(0)
+    E, topk = 8, 2
+    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+    w1, w2, w1_s, w2_s = _make_fp8_moe_weights(E, N, K, block_size)
+    score = torch.softmax(torch.randn(M, E), dim=-1)
+    topk_weight, topk_ids = torch.topk(score, topk)
+    topk_ids = topk_ids.to(torch.int32)
+    ref_out = ref_w8a16_block_fp8_moe(
+        a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, block_size
+    )
+
+    out = torch.empty_like(a)
+    ops.fused_experts_cpu(
+        out,
+        a.clone(),
+        _prepack_experts(w1),
+        _prepack_experts(w2),
+        topk_weight,
+        topk_ids,
+        ops.CPUQuantMethod.FP8_W8A16,
+        w1_s,
+        w2_s,
+        None,
+        None,
+        block_size,
+        is_vnni=True,
+    )
+    torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("M", FP8_NUM_TOKENS)
 @pytest.mark.parametrize("N,K,E,topk", FP8_MOE_CONFIGS)
 @pytest.mark.parametrize("seed", [0])

@@ -859,6 +859,12 @@ static inline void check_moe_scales(
   auto block_size_val = block_size.value();                   \
   int64_t block_size_N = block_size_val[0];                   \
   int64_t block_size_K = block_size_val[1];                   \
+  TORCH_CHECK(block_size_N > 0 && block_size_N % block_size_n() == 0, \
+              "fused_experts_cpu: block_size_N must be a multiple of ",  \
+              block_size_n());                                           \
+  TORCH_CHECK(block_size_K >= 32 && BLOCK_K % block_size_K == 0,         \
+              "fused_experts_cpu: block_size_K must divide ", BLOCK_K,   \
+              " and be at least 32");                                    \
   TORCH_CHECK(w1s.size(DIM0) == div_up(2 * N, block_size_N)); \
   TORCH_CHECK(w1s.size(DIM1) == div_up(K, block_size_K));     \
   TORCH_CHECK(w2s.size(DIM0) == div_up(K, block_size_N));     \

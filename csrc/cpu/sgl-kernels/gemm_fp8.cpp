@@ -271,7 +271,8 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
     constexpr int ROWS = BLOCK_M;
     constexpr int COLS = BLOCK_N / 16;
 
-    const int64_t KB = div_up(K, (int64_t)BLOCK_K);
+    // One scale per block_size_K rows of K (128, or a refined divisor of it).
+    const int64_t KB = div_up(K, block_size_K);
 
     // prefetch distance
     constexpr int PREFETCH_SIZE_K = 64;
@@ -325,7 +326,7 @@ struct tinygemm_kernel_nn<at::BFloat16, at::Float8_e4m3fn, float, has_bias, BLOC
       vsum[i] = _mm512_dpbf16_ps(vsum[i], va, vb[col]);
     };
 
-    constexpr int64_t BLOCK_K2 = BLOCK_K >> 1;
+    const int64_t BLOCK_K2 = block_size_K >> 1;
     for (int64_t kb = 0; kb < KB; ++kb) {
       int64_t kb_start = kb * BLOCK_K2;
       int64_t kb_end = std::min(K >> 1, kb_start + BLOCK_K2);
@@ -562,7 +563,8 @@ struct brgemm {
       int lda,
       int ldb,
       int ldc,
-      bool do_unpack = true) {
+      bool do_unpack = true,
+      int block_size_K = BLOCK_K) {
     TORCH_CHECK(false, "struct brgemm: primary template not implemented!");
   }
 };
@@ -585,17 +587,20 @@ struct brgemm<at::BFloat16, at::Float8_e4m3fn, float, has_bias> {
       int lda,
       int ldb,
       int ldc,
-      bool do_unpack = true) {
+      bool do_unpack = true,
+      int block_size_K = BLOCK_K) {
     constexpr int BLOCK_N = block_size_n();
 
     // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
     const int ldb_tmp = BLOCK_N;
 
     if (do_unpack) {
-      for (int k = 0; k < K; k += BLOCK_K) {
-        int kb_size = std::min(BLOCK_K, K - k);
+      // One scale per block_size_K rows of K (a divisor of 128, e.g. refined
+      // 64x64 blocks when the checkpoint blocks do not split across TP).
+      for (int k = 0; k < K; k += block_size_K) {
+        int kb_size = std::min(block_size_K, K - k);
 
-        int idx = k >> 7;  // k / BLOCK_K where BLOCK_K = 128
+        int idx = k / block_size_K;
         unpack_B(Btmp + k * ldb_tmp, B + k * ldb, N, kb_size, ldb, ldb_tmp, scale[idx]);
       }
     }
@@ -665,7 +670,8 @@ struct brgemm<at::BFloat16, uint8_t, uint8_t, has_bias> {
       int lda,
       int ldb,
       int ldc,
-      bool do_unpack = true) {
+      bool do_unpack = true,
+      int block_size_K = BLOCK_K) {
     constexpr int BLOCK_N = block_size_n();
 
     // [K, BLOCK_N] -> [K / 2, BLOCK_N * 2]
@@ -711,7 +717,7 @@ void tinygemm_kernel(
     bool do_unpack = true) {
   if (brg) {
     brgemm<scalar_t, packed_t, param_t, has_bias>::apply(
-        A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc, do_unpack);
+        A, B, C, Btmp, Ctmp, bias, scale, M, N, K, lda, ldb, ldc, do_unpack, block_size_K);
     return;
   }
 

@@ -171,10 +171,12 @@ def _moe_vllm_config(
     tp_size: int,
     *,
     fp8_checkpoint: bool = True,
+    hidden_size: int = 2560,
 ) -> SimpleNamespace:
     text_config = SimpleNamespace(
         moe_intermediate_size=640,
         shared_expert_intermediate_size=0,
+        hidden_size=hidden_size,
     )
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=text_config),
@@ -187,19 +189,24 @@ def _moe_vllm_config(
 
 
 @pytest.mark.parametrize(
-    ("fp8_checkpoint", "expected_intermediate_size"),
+    ("fp8_checkpoint", "hidden_size", "expected_intermediate_size"),
     [
-        pytest.param(False, 640, id="bf16"),
-        pytest.param(True, 768, id="fp8"),
+        pytest.param(False, 2560, 640, id="bf16"),
+        # 128x128 blocks refine to 64x64 at 320 rows per rank: no padding.
+        pytest.param(True, 2560, 640, id="fp8-refined"),
+        # gcd(128, 128, 320, 16) < 32 rules out refinement: pad to 768.
+        pytest.param(True, 16, 768, id="fp8-padded"),
     ],
 )
 def test_sparse_moe_constructs_with_expected_intermediate_size(
     fp8_checkpoint: bool,
+    hidden_size: int,
     expected_intermediate_size: int,
 ) -> None:
     vllm_config = _moe_vllm_config(
         tp_size=2,
         fp8_checkpoint=fp8_checkpoint,
+        hidden_size=hidden_size,
     )
     constructed: dict[str, int] = {}
 
@@ -220,7 +227,7 @@ def test_sparse_moe_constructs_with_expected_intermediate_size(
     assert constructed["intermediate_size"] == expected_intermediate_size
     assert vllm_config.model_config.hf_text_config.moe_intermediate_size == 640
     assert layer.original_intermediate_size_per_partition == 320
-    if fp8_checkpoint:
+    if expected_intermediate_size != 640:
         assert layer.experts.moe_config.intermediate_size_per_partition_unpadded == 320
     else:
         assert not hasattr(
@@ -230,7 +237,8 @@ def test_sparse_moe_constructs_with_expected_intermediate_size(
 
 
 def test_block_fp8_moe_checkpoint_padding_is_aligned_and_idempotent() -> None:
-    vllm_config = _moe_vllm_config(tp_size=2)
+    # hidden_size=16 rules out block refinement, so the padding path applies.
+    vllm_config = _moe_vllm_config(tp_size=2, hidden_size=16)
     weights = [
         (
             "model.layers.0.mlp.experts.0.gate_proj.weight",
