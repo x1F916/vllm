@@ -190,15 +190,9 @@ class Qwen4ExpQSACPUAttentionImpl(AttentionImpl):
         slot_mapping: torch.Tensor,
     ) -> None:
         del layer
-        valid = slot_mapping >= 0
-        if not torch.any(valid):
-            return
-        slots = slot_mapping[valid].long()
-        block_size = kv_cache.shape[2]
-        blocks = slots // block_size
-        offsets = slots % block_size
-        kv_cache[blocks, :, offsets, : self.head_size] = key[valid]
-        kv_cache[blocks, :, offsets, self.head_size :] = value[valid]
+        from .ops.qsa import qsa_store_kv
+
+        qsa_store_kv(kv_cache, slot_mapping, key, value)
 
     def forward_qsa(
         self,
