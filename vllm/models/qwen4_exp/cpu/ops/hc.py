@@ -73,97 +73,6 @@ def _grouped_gemma_rmsnorm(
 
 
 @triton.jit
-def _hc_silu_kernel(
-    x_ptr,
-    y_ptr,
-    stride_x,
-    stride_y,
-    DIM: tl.constexpr,
-    HC: tl.constexpr,
-) -> None:
-    BLOCK_SIZE: tl.constexpr = triton.next_power_of_2(DIM)
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_SIZE)
-    mask = offs < DIM
-    x = tl.load(x_ptr + row * stride_x + offs, mask).to(tl.float32) / HC
-    y = x * tl.sigmoid(x)
-    tl.store(y_ptr + row * stride_y + offs, y, mask)
-
-
-def _hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
-    num_tokens, DIM = x.shape
-    assert x.stride(1) == 1
-    output = x.new_empty(x.shape)
-    grid = (num_tokens,)
-    launch(
-        _hc_silu_kernel,
-        grid,
-        x,
-        output,
-        x.stride(0),
-        output.stride(0),
-        DIM=DIM,
-        HC=hc_count,
-        num_cpu_threads=grid_num_threads(*grid),
-    )
-    return output
-
-
-@triton.jit
-def _hc_gate_mix_kernel(
-    x_ptr,
-    g_ptr,
-    y_ptr,
-    stride_x,
-    stride_g,
-    stride_y,
-    DIM: tl.constexpr,
-    HC: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-) -> None:
-    HC_DIM: tl.constexpr = DIM // HC
-    row = tl.program_id(0)
-    tile_id = tl.program_id(1)
-    offs_inner = tile_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs_inner < HC_DIM
-    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    for stream in tl.static_range(HC):
-        offsets = stream * HC_DIM + offs_inner
-        g = tl.load(g_ptr + row * stride_g + offsets, mask, other=0.0)
-        x = tl.load(x_ptr + row * stride_x + offsets, mask, other=0.0)
-        acc += tl.sigmoid(g.to(tl.float32)) * x.to(tl.float32)
-    acc /= HC
-    tl.store(y_ptr + row * stride_y + offs_inner, acc, mask)
-
-
-def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
-    N, DIM = gate.shape
-    assert x.shape == gate.shape
-    assert DIM % hc_count == 0
-    assert x.stride(1) == 1
-    assert gate.stride(1) == 1
-    HC_DIM = DIM // hc_count
-    out = x.new_empty(N, HC_DIM)
-    BLOCK_SIZE = 512
-    grid = (N, triton.cdiv(HC_DIM, BLOCK_SIZE))
-    launch(
-        _hc_gate_mix_kernel,
-        grid,
-        x,
-        gate,
-        out,
-        x.stride(0),
-        gate.stride(0),
-        out.stride(0),
-        DIM,
-        hc_count,
-        BLOCK_SIZE,
-        num_cpu_threads=grid_num_threads(*grid),
-    )
-    return out
-
-
-@triton.jit
 def _hc_combine_kernel(
     block_ptr,
     res_ptr,
@@ -238,119 +147,8 @@ def _hc_combine(
     return out
 
 
-@triton.jit
-def _hc_combine_norm_kernel(
-    block_ptr,
-    res_ptr,
-    inj_ptr,
-    w_ptr,
-    out_ptr,
-    y_ptr,
-    stride_block,
-    stride_res,
-    stride_inj,
-    stride_out,
-    stride_y,
-    HC_DIM: tl.constexpr,
-    HC: tl.constexpr,
-    W_SHARED: tl.constexpr,
-    EPS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-) -> None:
-    HC_PAD: tl.constexpr = triton.next_power_of_2(HC)
-    NUM_TILES: tl.constexpr = triton.cdiv(HC_DIM, BLOCK_SIZE)
-    NUM_TILES_PAD: tl.constexpr = triton.next_power_of_2(NUM_TILES)
-    row = tl.program_id(0)
-    stream = tl.program_id(1)
-    offs_hc = tl.arange(0, HC_PAD)
-    mask_hc = offs_hc < HC
-    tile_ids = tl.arange(0, NUM_TILES_PAD)
-    offs_inner = tile_ids[:, None] * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)[None, :]
-    mask_inner = offs_inner < HC_DIM
-    offs = stream * HC_DIM + offs_inner
-    w_offs = offs_inner if W_SHARED else offs
-
-    res = tl.load(res_ptr + row * stride_res + offs, mask_inner, other=0.0)
-    if inj_ptr is not None:
-        inj = tl.load(inj_ptr + row * stride_inj + offs_hc, mask_hc, other=0.0)
-    block = tl.load(block_ptr + row * stride_block + offs_inner, mask_inner, other=0.0)
-    if inj_ptr is not None:
-        inj = 2.0 * tl.sigmoid(inj.to(tl.float32) / HC)
-        inj = tl.sum(tl.where(offs_hc == stream, inj, 0.0))
-        out = res.to(tl.float32) + block.to(tl.float32) * inj
-    else:
-        out = res.to(tl.float32) + block.to(tl.float32)
-    # Preserve the unfused combine -> RMSNorm rounding boundary.
-    out = out.to(out_ptr.dtype.element_ty)
-    tl.store(out_ptr + row * stride_out + offs, out, mask=mask_inner)
-
-    out = out.to(tl.float32)
-    sum_sq = tl.sum(tl.sum(out * out, axis=1), axis=0)
-    rrms = tl.rsqrt(sum_sq / HC_DIM + EPS)
-    w = tl.load(w_ptr + w_offs, mask_inner, other=0.0)
-    y = out * rrms
-    y += y * w.to(tl.float32)
-    tl.store(y_ptr + row * stride_y + offs, y, mask_inner)
-
-
-def _hc_combine_norm(
-    residual: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor | None,
-    norm_weight: torch.Tensor,
-    eps: float,
-    hc_count: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    N, DIM = residual.shape
-    assert DIM % hc_count == 0
-    hc_dim = DIM // hc_count
-    assert block_output.shape == (N, hc_dim)
-    assert residual.stride(1) == 1
-    assert block_output.stride(1) == 1
-    if injection_logits is not None:
-        assert injection_logits.shape == (N, hc_count)
-        assert injection_logits.stride(1) == 1
-    assert norm_weight.is_contiguous()
-    assert norm_weight.numel() in (hc_dim, DIM)
-    stride_injection = injection_logits.stride(0) if injection_logits is not None else 0
-
-    out = residual.new_empty(residual.shape)
-    y = residual.new_empty(residual.shape)
-    BLOCK_SIZE = 512
-    grid = (N, hc_count)
-    launch(
-        _hc_combine_norm_kernel,
-        grid,
-        block_output,
-        residual,
-        injection_logits,
-        norm_weight,
-        out,
-        y,
-        block_output.stride(0),
-        residual.stride(0),
-        stride_injection,
-        out.stride(0),
-        y.stride(0),
-        hc_dim,
-        hc_count,
-        W_SHARED=norm_weight.numel() == hc_dim,
-        EPS=eps,
-        BLOCK_SIZE=BLOCK_SIZE,
-        num_cpu_threads=grid_num_threads(*grid),
-    )
-    return out, y
-
-
 def _same_shape_fake(x: torch.Tensor, *args) -> torch.Tensor:
     return x.new_empty(x.shape)
-
-
-def _hc_gate_mix_fake(
-    x: torch.Tensor, gate: torch.Tensor, hc_count: int
-) -> torch.Tensor:
-    del gate
-    return x.new_empty((x.shape[0], x.shape[1] // hc_count))
 
 
 def _hc_combine_fake(
@@ -363,42 +161,15 @@ def _hc_combine_fake(
     return residual.new_empty(residual.shape)
 
 
-def _hc_combine_norm_fake(
-    residual: torch.Tensor,
-    block_output: torch.Tensor,
-    injection_logits: torch.Tensor | None,
-    norm_weight: torch.Tensor,
-    eps: float,
-    hc_count: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del block_output, injection_logits, norm_weight, eps, hc_count
-    return residual.new_empty(residual.shape), residual.new_empty(residual.shape)
-
-
 direct_register_custom_op(
     op_name="qwen4_exp_cpu_grouped_gemma_rmsnorm",
     op_func=_grouped_gemma_rmsnorm,
     fake_impl=_same_shape_fake,
 )
 direct_register_custom_op(
-    op_name="qwen4_exp_cpu_hc_silu",
-    op_func=_hc_silu,
-    fake_impl=_same_shape_fake,
-)
-direct_register_custom_op(
-    op_name="qwen4_exp_cpu_hc_gate_mix",
-    op_func=_hc_gate_mix,
-    fake_impl=_hc_gate_mix_fake,
-)
-direct_register_custom_op(
     op_name="qwen4_exp_cpu_hc_combine",
     op_func=_hc_combine,
     fake_impl=_hc_combine_fake,
-)
-direct_register_custom_op(
-    op_name="qwen4_exp_cpu_hc_combine_norm",
-    op_func=_hc_combine_norm,
-    fake_impl=_hc_combine_norm_fake,
 )
 
 
@@ -410,12 +181,17 @@ def grouped_gemma_rmsnorm(
     )
 
 
+# silu, gate_mix and combine_norm run once or twice per HC module on a few
+# KiB per token. As plain torch ops Inductor fuses them into the surrounding
+# graph, which is cheaper than a Triton launch per op.
 def hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_cpu_hc_silu(x, hc_count)
+    x_f32 = x.float() / hc_count
+    return (x_f32 * torch.sigmoid(x_f32)).to(x.dtype)
 
 
 def hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
-    return torch.ops.vllm.qwen4_exp_cpu_hc_gate_mix(x, gate, hc_count)
+    gated = torch.sigmoid(gate.float()) * x.float()
+    return gated.unflatten(-1, (hc_count, -1)).sum(-2).div(hc_count).to(x.dtype)
 
 
 def hc_combine(
@@ -437,14 +213,19 @@ def hc_combine_norm(
     eps: float,
     hc_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    return torch.ops.vllm.qwen4_exp_cpu_hc_combine_norm(
-        residual,
-        block_output,
-        injection_logits,
-        norm_weight,
-        eps,
-        hc_count,
-    )
+    residual_f32 = residual.float().unflatten(-1, (hc_count, -1))
+    block_f32 = block_output.float().unsqueeze(-2)
+    if injection_logits is not None:
+        scale = 2.0 * torch.sigmoid(injection_logits.float() / hc_count)
+        block_f32 = block_f32 * scale.unsqueeze(-1)
+    # Preserve the unfused combine -> RMSNorm rounding boundary.
+    combined = (residual_f32 + block_f32).to(residual.dtype)
+    combined_f32 = combined.float()
+    variance = combined_f32.square().mean(-1, keepdim=True)
+    normed = combined_f32 * torch.rsqrt(variance + eps)
+    weight = norm_weight.float().view(-1, combined.shape[-1])
+    normed = normed + normed * weight
+    return combined.flatten(-2), normed.to(residual.dtype).flatten(-2)
 
 
 __all__ = [
