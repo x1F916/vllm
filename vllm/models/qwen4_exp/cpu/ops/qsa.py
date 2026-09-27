@@ -132,10 +132,12 @@ def _expand_qsa_indices_kernel(
     stride_output_column,
     rows,
     num_requests,
+    capacity,
     BLOCK_TOPK: tl.constexpr,
     COMPRESS_RATIO: tl.constexpr,
     OUTPUT_WIDTH: tl.constexpr,
     COLUMN_BLOCK: tl.constexpr,
+    ALL_VISIBLE: tl.constexpr,
 ) -> None:
     row = tl.program_id(0)
     columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
@@ -156,6 +158,8 @@ def _expand_qsa_indices_kernel(
         BLOCK_TOPK,
     )
     complete_blocks = tl.maximum(complete_blocks, 0)
+    if ALL_VISIBLE:
+        complete_blocks = tl.minimum(complete_blocks, capacity)
     expanded_count = complete_blocks * COMPRESS_RATIO
     tail_start = ((query_position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
     tail_count = tl.maximum((query_position + 1) - tail_start, 0)
@@ -163,13 +167,17 @@ def _expand_qsa_indices_kernel(
     is_expanded = columns < expanded_count
     block_rank = columns // COMPRESS_RATIO
     offset = columns % COMPRESS_RATIO
-    block = tl.load(
-        block_indices_ptr
-        + row * stride_blocks_row
-        + tl.minimum(block_rank, BLOCK_TOPK - 1) * stride_blocks_column,
-        mask=(row < rows) & is_expanded,
-        other=-1,
-    )
+    if ALL_VISIBLE:
+        # Every visible block fits the budget: rank r selects block r.
+        block = block_rank
+    else:
+        block = tl.load(
+            block_indices_ptr
+            + row * stride_blocks_row
+            + tl.minimum(block_rank, BLOCK_TOPK - 1) * stride_blocks_column,
+            mask=(row < rows) & is_expanded,
+            other=-1,
+        )
     expanded = block * COMPRESS_RATIO + offset
     tail_offset = columns - expanded_count
     is_tail = (
@@ -723,15 +731,25 @@ def qsa_mqa_paged(
 
 
 def expand_qsa_block_indices(
-    block_indices: torch.Tensor,
+    block_indices: torch.Tensor | None,
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
     token_to_req: torch.Tensor,
     compress_ratio: int,
     token_topk: int,
     out: torch.Tensor | None = None,
+    capacity: int | None = None,
 ) -> torch.Tensor:
-    """Expand compressed blocks and append the causal open-group tail."""
+    """Expand compressed blocks and append the causal open-group tail.
+
+    ``block_indices=None`` means every visible block fits the budget, so each
+    row selects its first visible blocks (at most ``capacity``) in order.
+    """
+    all_visible = block_indices is None
+    if all_visible:
+        if capacity is None:
+            raise ValueError("QSA all-visible expansion requires a capacity")
+        block_indices = query_positions
     if block_indices.device.type != "cpu" or not has_active_triton_cpu_backend():
         raise RuntimeError("CPU QSA index expansion requires Triton and CPU tensors")
     if compress_ratio <= 0 or token_topk % compress_ratio:
@@ -739,7 +757,10 @@ def expand_qsa_block_indices(
             "QSA token top-k must be divisible by a positive compression ratio"
         )
     block_topk = token_topk // compress_ratio
-    if block_indices.shape != (query_positions.numel(), block_topk):
+    if not all_visible and block_indices.shape != (
+        query_positions.numel(),
+        block_topk,
+    ):
         raise ValueError("QSA compressed top-k has an invalid shape")
     if token_to_req.shape != query_positions.shape:
         raise ValueError("QSA request mapping must match query positions")
@@ -748,7 +769,7 @@ def expand_qsa_block_indices(
     tensors = (query_positions, sequence_lengths, token_to_req)
     if any(tensor.device != block_indices.device for tensor in tensors):
         raise ValueError("QSA index-expansion tensors must share one CPU device")
-    if block_indices.stride(1) != 1:
+    if not all_visible and block_indices.stride(1) != 1:
         raise ValueError("QSA compressed-index rows must be contiguous")
     output_width = token_topk + compress_ratio - 1
     if out is None:
@@ -778,15 +799,17 @@ def expand_qsa_block_indices(
         token_to_req,
         out,
         block_indices.stride(0),
-        block_indices.stride(1),
+        0 if all_visible else block_indices.stride(1),
         out.stride(0),
         out.stride(1),
         block_indices.shape[0],
         sequence_lengths.shape[0],
+        capacity if all_visible else 0,
         BLOCK_TOPK=block_topk,
         COMPRESS_RATIO=compress_ratio,
         OUTPUT_WIDTH=output_width,
         COLUMN_BLOCK=column_block,
+        ALL_VISIBLE=all_visible,
         num_cpu_threads=grid_num_threads(*grid),
     )
     return out
@@ -802,8 +825,13 @@ def qsa_select_paged_tokens(
     token_topk: int,
     compress_ratio: int,
     out: torch.Tensor | None = None,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
-    """Score, batched top-k select, and expand QSA indices."""
+    """Score, batched top-k select, and expand QSA indices.
+
+    ``max_seq_len`` (host-side, from the attention metadata) bounds the visible
+    blocks without reading the position tensors.
+    """
     if token_topk <= 0 or token_topk % compress_ratio:
         raise ValueError("QSA token top-k must be positive and divisible by ratio")
     rows = q.shape[0]
@@ -823,30 +851,25 @@ def qsa_select_paged_tokens(
     block_topk = token_topk // compress_ratio
     # Upper bound on visible blocks; exact per-row values are only needed
     # when every visible block fits the budget.
-    max_visible = min(
-        (int(query_positions.max()) + 1) // compress_ratio,
-        int(sequence_lengths.max()) // compress_ratio,
-        capacity,
-    )
+    if max_seq_len is not None:
+        max_visible = min(max_seq_len // compress_ratio, capacity)
+    else:
+        max_visible = min(
+            (int(query_positions.max()) + 1) // compress_ratio,
+            int(sequence_lengths.max()) // compress_ratio,
+            capacity,
+        )
     if max_visible <= block_topk:
         # Every visible block fits the budget, so scoring cannot change the set.
-        num_requests = sequence_lengths.shape[0]
-        known = (token_to_req >= 0) & (token_to_req < num_requests)
-        lengths = sequence_lengths[token_to_req.clamp(0, num_requests - 1).long()]
-        visible = torch.minimum(
-            (query_positions + 1) // compress_ratio, lengths // compress_ratio
-        )
-        visible = torch.where(known, visible.clamp(0, capacity), 0)
-        ranks = torch.arange(block_topk, dtype=torch.int32, device=q.device)
-        selected = torch.where(ranks[None, :] < visible[:, None], ranks, -1)
         expand_qsa_block_indices(
-            selected.to(torch.int32),
+            None,
             query_positions,
             sequence_lengths,
             token_to_req,
             compress_ratio,
             token_topk,
             out,
+            capacity=capacity,
         )
         return out
     # Columns past the longest visible prefix always score -inf.
@@ -929,8 +952,13 @@ def qsa_sparse_paged_attention(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    max_selected: int | None = None,
 ) -> torch.Tensor:
-    """Run sparse GQA over paged BF16 CPU K/V caches with Triton."""
+    """Run sparse GQA over paged BF16 CPU K/V caches with Triton.
+
+    ``max_selected`` is a host-side upper bound on valid indices per row; it
+    avoids counting them on every call.
+    """
     if q.device.type != "cpu":
         raise RuntimeError("paged CPU QSA requires Triton and CPU tensors")
     if not has_active_triton_cpu_backend():
@@ -982,7 +1010,9 @@ def qsa_sparse_paged_attention(
     block_m = triton.next_power_of_2(group_size)
     block_n = 16
     # Expanded selections are compact: valid indices first, then -1.
-    max_selected = int((logical_indices >= 0).sum(dim=1).max())
+    if max_selected is None:
+        max_selected = int((logical_indices >= 0).sum(dim=1).max())
+    max_selected = min(max_selected, logical_indices.shape[1])
     num_tiles = max(1, triton.cdiv(max_selected, block_n))
     num_splits = _qsa_sparse_num_splits(
         q.shape[0],

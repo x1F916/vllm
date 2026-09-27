@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Runtime requirements for the Qwen4Exp CPU implementation."""
 
+import functools
 from typing import TYPE_CHECKING
 
 from vllm.platforms import current_platform
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
+@functools.cache
 def has_active_triton_cpu_backend() -> bool:
     """Return whether Triton's selected runtime target is CPU."""
     if not HAS_TRITON:

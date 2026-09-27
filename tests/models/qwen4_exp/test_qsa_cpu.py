@@ -7,6 +7,7 @@ import torch
 from vllm.models.qwen4_exp.common import qsa_cache
 from vllm.models.qwen4_exp.cpu.ops import qsa as qsa_ops
 from vllm.models.qwen4_exp.cpu.ops.qsa import (
+    expand_qsa_block_indices,
     qsa_compress_groups_with_ratio,
     qsa_select_paged_tokens,
     qsa_sparse_paged_attention,
@@ -117,6 +118,43 @@ def test_qsa_cpu_selection_handles_short_contexts_and_reuses_output(
         [6, 7, 10, 11, -1],
         [-1, -1, -1, -1, -1],
     ]
+
+
+@requires_triton_cpu
+@pytest.mark.parametrize("capacity", [100, 3])
+def test_qsa_cpu_all_visible_expansion_matches_explicit_ranks(capacity) -> None:
+    """The all-visible mode selects the same tokens as ranks 0..visible-1.
+
+    It also keeps rows compact (valid indices first) when ``capacity`` binds,
+    where expanding explicit ranks leaves -1 gaps before the open-group tail.
+    """
+    ratio, token_topk = 4, 32
+    block_topk = token_topk // ratio
+    gen = torch.Generator().manual_seed(0)
+    rows, num_requests = 64, 5
+    token_to_req = torch.randint(-1, num_requests + 1, (rows,), generator=gen)
+    token_to_req = token_to_req.to(torch.int32)
+    query_positions = torch.randint(0, 32, (rows,), generator=gen)
+    sequence_lengths = torch.randint(1, 33, (num_requests,), generator=gen)
+    sequence_lengths = sequence_lengths.to(torch.int32)
+
+    known = (token_to_req >= 0) & (token_to_req < num_requests)
+    lengths = sequence_lengths[token_to_req.clamp(0, num_requests - 1).long()]
+    visible = torch.minimum((query_positions + 1) // ratio, lengths // ratio)
+    visible = torch.where(known, visible.clamp(0, capacity), 0)
+    ranks = torch.arange(block_topk, dtype=torch.int32)
+    selected = torch.where(ranks[None, :] < visible[:, None], ranks, -1)
+    args = (query_positions, sequence_lengths, token_to_req, ratio, token_topk)
+    expected = expand_qsa_block_indices(selected.to(torch.int32), *args)
+
+    actual = expand_qsa_block_indices(None, *args, capacity=capacity)
+
+    for got, want in zip(actual.tolist(), expected.tolist()):
+        assert sorted(x for x in got if x >= 0) == sorted(x for x in want if x >= 0)
+        num_valid = sum(x >= 0 for x in got)
+        assert all(x >= 0 for x in got[:num_valid])
+    if capacity >= block_topk:
+        assert torch.equal(actual, expected)
 
 
 @requires_triton_cpu
