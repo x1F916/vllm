@@ -192,7 +192,7 @@ def _expand_qsa_indices_kernel(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "num_tiles"])
 def _qsa_sparse_paged_gqa_splitk_kernel(
     q_ptr,
     k_cache_ptr,
@@ -218,6 +218,7 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     num_rows,
     num_cache_blocks,
     num_requests,
+    num_tiles,
     TOPK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     PAGE_TABLE_WIDTH: tl.constexpr,
@@ -225,7 +226,6 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     HEAD_DIM: tl.constexpr,
     NUM_QUERY_HEADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
-    NUM_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ) -> None:
@@ -253,8 +253,8 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
     accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
     softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
 
-    split_tile_start = split_id * NUM_TILES // NUM_SPLITS
-    split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
+    split_tile_start = split_id * num_tiles // NUM_SPLITS
+    split_tile_end = (split_id + 1) * num_tiles // NUM_SPLITS
     for tile in range(split_tile_start, split_tile_end):
         columns = tile * BLOCK_N + column_offsets
         logical_token = tl.load(
@@ -768,8 +768,38 @@ def qsa_select_paged_tokens(
     if not rows:
         return out
 
-    columns = page_table.shape[1] * k_cache.shape[1]
+    capacity = page_table.shape[1] * k_cache.shape[1]
     block_topk = token_topk // compress_ratio
+    # Upper bound on visible blocks; exact per-row values are only needed
+    # when every visible block fits the budget.
+    max_visible = min(
+        (int(query_positions.max()) + 1) // compress_ratio,
+        int(sequence_lengths.max()) // compress_ratio,
+        capacity,
+    )
+    if max_visible <= block_topk:
+        # Every visible block fits the budget, so scoring cannot change the set.
+        num_requests = sequence_lengths.shape[0]
+        known = (token_to_req >= 0) & (token_to_req < num_requests)
+        lengths = sequence_lengths[token_to_req.clamp(0, num_requests - 1).long()]
+        visible = torch.minimum(
+            (query_positions + 1) // compress_ratio, lengths // compress_ratio
+        )
+        visible = torch.where(known, visible.clamp(0, capacity), 0)
+        ranks = torch.arange(block_topk, dtype=torch.int32, device=q.device)
+        selected = torch.where(ranks[None, :] < visible[:, None], ranks, -1)
+        expand_qsa_block_indices(
+            selected.to(torch.int32),
+            query_positions,
+            sequence_lengths,
+            token_to_req,
+            compress_ratio,
+            token_topk,
+            out,
+        )
+        return out
+    # Columns past the longest visible prefix always score -inf.
+    columns = min(capacity, triton.cdiv(max_visible, 32) * 32)
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     selected = torch.empty(
         (min(rows, rows_per_chunk), block_topk),
@@ -789,6 +819,7 @@ def qsa_select_paged_tokens(
             query_positions[row_slice],
             sequence_lengths,
             compress_ratio,
+            num_columns=columns,
         )
         selected_count = min(columns, block_topk)
         if selected_count:
@@ -899,7 +930,9 @@ def qsa_sparse_paged_attention(
     group_size = q.shape[1] // k_cache.shape[2]
     block_m = triton.next_power_of_2(group_size)
     block_n = 16
-    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+    # Expanded selections are compact: valid indices first, then -1.
+    max_selected = int((logical_indices >= 0).sum(dim=1).max())
+    num_tiles = max(1, triton.cdiv(max_selected, block_n))
     num_splits = _qsa_sparse_num_splits(
         q.shape[0],
         k_cache.shape[2],
@@ -948,6 +981,7 @@ def qsa_sparse_paged_attention(
         q.shape[0],
         k_cache.shape[0],
         block_table.shape[0],
+        num_tiles,
         TOPK=logical_indices.shape[1],
         PAGE_SIZE=k_cache.shape[1],
         PAGE_TABLE_WIDTH=block_table.shape[1],
@@ -955,7 +989,6 @@ def qsa_sparse_paged_attention(
         HEAD_DIM=q.shape[2],
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
-        NUM_TILES=num_tiles,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         num_cpu_threads=0,
