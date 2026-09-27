@@ -206,6 +206,7 @@ class Qwen4ExpQSACPUAttentionImpl(AttentionImpl):
         attn_metadata: CPUAttentionMetadata,
         output: torch.Tensor,
         token_to_req: torch.Tensor,
+        max_seq_len: int | None = None,
         **kwargs,
     ) -> torch.Tensor:
         del key, value, kwargs
@@ -228,6 +229,7 @@ class Qwen4ExpQSACPUAttentionImpl(AttentionImpl):
             attn_metadata.block_table,
             token_to_req[:num_tokens],
             output[:num_tokens],
+            max_selected=max_seq_len,
         )
         return output
 
@@ -384,8 +386,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
     def _run_qsa(
         self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -409,8 +411,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         if side_metadata.num_actual_tokens != num_tokens:
             raise RuntimeError("QSA main and side metadata token counts disagree")
         selected = self.indexer(
-            hidden_states,
-            positions,
+            index_q,
+            index_k,
             self.topk_indices_buffer[:num_tokens],
         )
         if selected.shape != (num_tokens, self.indexer.output_width):
@@ -432,6 +434,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            max_seq_len=side_metadata.max_seq_len,
         )
 
     def forward(
@@ -441,6 +444,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v, gate = self._project_qkv_gate(qkv, positions)
+        # The indexer projection, norm and RoPE are plain tensor ops; keeping
+        # them in the compiled graph lets Inductor fuse them.
+        index_q, index_k = self.indexer.project_qk(hidden_states, positions)
         num_tokens = hidden_states.shape[0]
         query = q.view(num_tokens, self.num_heads, self.head_dim)
         key = k.view(num_tokens, self.num_kv_heads, self.head_dim)
@@ -449,8 +455,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         encoded_layer_name = _encode_layer_name(self.layer_name)
         if current_platform.opaque_attention_op():
             torch.ops.vllm.qwen4_exp_qsa_with_output(
-                hidden_states,
-                positions,
+                index_q,
+                index_k,
                 query,
                 key,
                 value,
@@ -459,8 +465,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             )
         else:
             qwen4_exp_qsa_with_output(
-                hidden_states,
-                positions,
+                index_q,
+                index_k,
                 query,
                 key,
                 value,
@@ -475,8 +481,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
 
 
 def qwen4_exp_qsa_with_output(
-    hidden_states: torch.Tensor,
-    positions: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -489,8 +495,8 @@ def qwen4_exp_qsa_with_output(
     if not isinstance(layer, Qwen4ExpQSAAttention):
         raise TypeError(f"{layer_name} is not a Qwen4Exp QSA owner")
     layer._run_qsa(
-        hidden_states,
-        positions,
+        index_q,
+        index_k,
         query,
         key,
         value,

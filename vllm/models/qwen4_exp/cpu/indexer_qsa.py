@@ -178,8 +178,6 @@ class QSAIndexer(nn.Module):
         )
         if raw.num_actual_tokens != compressed.num_actual_tokens:
             raise RuntimeError("QSA side-cache metadata token counts disagree")
-        if not torch.equal(raw.logical_positions, compressed.logical_positions):
-            raise RuntimeError("QSA side-cache metadata positions disagree")
         return raw, compressed
 
     def _update_and_compress(
@@ -193,24 +191,27 @@ class QSAIndexer(nn.Module):
         from .ops.qsa import qsa_compress_groups_with_ratio, qsa_store_cache_rows
 
         logical_positions = raw_metadata.logical_positions[:num_tokens]
-        position_rows = logical_positions.view(-1, 1, 1).expand(-1, 1, 3)
-        pooled, first_positions = qsa_compress_groups_with_ratio(
-            token_k[:num_tokens],
-            position_rows,
-            raw_key_cache,
-            raw_metadata.block_table,
-            raw_metadata.token_to_req,
-            raw_metadata.query_start_loc,
-            logical_positions,
-            compressed_metadata.slot_mapping,
-            self.compress_ratio,
-        )
-        normalized = self.normalize_compressed_keys(pooled, first_positions)
-        qsa_store_cache_rows(
-            self.compressed_key_cache.kv_cache,
-            compressed_metadata.slot_mapping,
-            normalized,
-        )
+        # A compressed slot exists only for tokens that close a group, so most
+        # single-token decode steps have nothing to pool or normalize.
+        if bool((compressed_metadata.slot_mapping[:num_tokens] >= 0).any()):
+            position_rows = logical_positions.view(-1, 1, 1).expand(-1, 1, 3)
+            pooled, first_positions = qsa_compress_groups_with_ratio(
+                token_k[:num_tokens],
+                position_rows,
+                raw_key_cache,
+                raw_metadata.block_table,
+                raw_metadata.token_to_req,
+                raw_metadata.query_start_loc,
+                logical_positions,
+                compressed_metadata.slot_mapping,
+                self.compress_ratio,
+            )
+            normalized = self.normalize_compressed_keys(pooled, first_positions)
+            qsa_store_cache_rows(
+                self.compressed_key_cache.kv_cache,
+                compressed_metadata.slot_mapping,
+                normalized,
+            )
         qsa_store_cache_rows(
             raw_key_cache,
             raw_metadata.slot_mapping,
@@ -235,24 +236,29 @@ class QSAIndexer(nn.Module):
             self.token_topk,
             self.compress_ratio,
             out,
+            max_seq_len=metadata.max_seq_len,
         )
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
+        q: torch.Tensor,
+        token_k: torch.Tensor,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return fixed-width request-relative token indices padded with ``-1``."""
+        """Return fixed-width request-relative token indices padded with ``-1``.
+
+        ``q`` and ``token_k`` come from ``project_qk``, which runs in the
+        compiled graph ahead of the opaque QSA op.
+        """
         metadata = self._metadata()
         if metadata is None:
             if self.skip_topk and out is not None:
                 return out
             result = torch.full(
-                (hidden_states.shape[0], self.output_width),
+                (q.shape[0], self.output_width),
                 -1,
                 dtype=torch.int32,
-                device=hidden_states.device,
+                device=q.device,
             )
             if out is not None:
                 out.copy_(result)
@@ -260,11 +266,8 @@ class QSAIndexer(nn.Module):
             return result
         raw_metadata, compressed_metadata = metadata
         num_tokens = raw_metadata.num_actual_tokens
-        q, token_k = self.project_qk(
-            hidden_states[:num_tokens], positions[..., :num_tokens]
-        )
         self._update_and_compress(
-            token_k,
+            token_k[:num_tokens],
             raw_metadata,
             compressed_metadata,
         )
@@ -272,7 +275,7 @@ class QSAIndexer(nn.Module):
             if out is None:
                 raise RuntimeError("QSA top-k reuse requires an output buffer")
             return out
-        return self._select(q, compressed_metadata, out)
+        return self._select(q[:num_tokens], compressed_metadata, out)
 
 
 __all__ = ["QSAIndexer", "apply_qsa_rmsnorm", "apply_qsa_rope"]
