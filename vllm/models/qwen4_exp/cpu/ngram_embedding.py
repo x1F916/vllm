@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
@@ -23,6 +24,9 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import (
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     is_layer_skipped,
+)
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    get_masked_input_and_mask,
 )
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.parameter import (
@@ -41,7 +45,11 @@ logger = init_logger(__name__)
 
 
 class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding):
-    """TP-replicated, CPU-resident PLE embedding table."""
+    """CPU-resident PLE embedding table, sharded by vocab across TP ranks.
+
+    A decode token reads only a few rows, so sharding costs one small
+    all-reduce per PLE layer and halves the table memory at TP=2.
+    """
 
     supports_prefetch = False
 
@@ -60,6 +68,7 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding):
     ) -> None:
         del num_ngram_heads, max_total_tokens, data_parallel_rank
         self.embedding_method = embedding_method
+        self.output_dtype = params_dtype
         super().__init__(
             num_embeddings,
             embedding_dim,
@@ -67,8 +76,26 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding):
             padding_size=padding_size,
             prefix=prefix,
             quant_method=embedding_method,
-            disable_tp=True,
         )
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.tp_size == 1:
+            return super().forward(input_)
+        indices = self.shard_indices
+        masked_input, input_mask = get_masked_input_and_mask(
+            input_,
+            indices.org_vocab_start_index,
+            indices.org_vocab_end_index,
+            indices.num_org_vocab_padding,
+            indices.added_vocab_start_index,
+            indices.added_vocab_end_index,
+        )
+        rows = self.quant_method.embedding(self, masked_input.long())
+        # The CPU all-reduce takes floating types only, so dequantize the
+        # local rows first. Each row has one owner rank; the sum is exact.
+        rows = self.embedding_method.dequantize(self, rows, self.output_dtype)
+        rows.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return tensor_model_parallel_all_reduce(rows)
 
     def allocate_embedding_weight(
         self,
@@ -84,6 +111,9 @@ class Qwen4ExpPLEEmbedding(PLEVocabParallelEmbedding):
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
         """Dequantize only rows selected by the embedding lookup."""
+        if self.tp_size > 1:
+            # forward() already dequantized the rows before the all-reduce.
+            return embeddings.to(output_dtype)
         return self.embedding_method.dequantize(self, embeddings, output_dtype)
 
     def start_prefetch(
