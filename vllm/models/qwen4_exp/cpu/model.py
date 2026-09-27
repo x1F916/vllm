@@ -7,7 +7,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
-from math import lcm
+from math import gcd, lcm
 
 import torch
 from torch import nn
@@ -94,8 +94,13 @@ def _get_padded_moe_intermediate_size(
     quant_config: QuantizationConfig | None,
     intermediate_size: int,
     tp_size: int,
+    hidden_size: int,
 ) -> int:
-    """Pad serialized block-FP8 experts to whole blocks on every TP rank."""
+    """Pad serialized block-FP8 experts to whole blocks on every TP rank.
+
+    No padding is needed when vLLM can refine the block scales instead (see
+    ``refine_fp8_moe_block_shape``), which the CPU FP8 MoE kernel accepts.
+    """
     if (
         quant_config is None
         or quant_config.get_name() != "fp8"
@@ -108,6 +113,10 @@ def _get_padded_moe_intermediate_size(
 
     block_n, block_k = (int(size) for size in block_size)
     alignment = tp_size * lcm(block_n, block_k)
+    if intermediate_size % alignment and intermediate_size % tp_size == 0:
+        per_partition = intermediate_size // tp_size
+        if gcd(block_n, block_k, per_partition, hidden_size) >= 32:
+            return intermediate_size
     return (intermediate_size + alignment - 1) // alignment * alignment
 
 
@@ -181,6 +190,7 @@ def _pad_moe_checkpoint_weights(
         quant_config,
         intermediate_size,
         vllm_config.parallel_config.tensor_parallel_size,
+        config.hidden_size,
     )
     block_size = getattr(quant_config, "weight_block_size", None)
     if padded_intermediate_size == intermediate_size or block_size is None:
@@ -294,6 +304,7 @@ class Qwen4ExpSparseMoeBlock(Qwen3NextSparseMoeBlock):
             vllm_config.quant_config,
             intermediate_size,
             tp_size,
+            config.hidden_size,
         )
         config.moe_intermediate_size = padded_intermediate_size
         try:

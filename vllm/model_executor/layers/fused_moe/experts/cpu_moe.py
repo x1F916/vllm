@@ -37,7 +37,9 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    GroupShape,
     QuantKey,
+    create_fp8_quant_key,
     kFp8Dynamic128Sym,
     kFp8Static128BlockSym,
     kInt4Static,
@@ -454,6 +456,17 @@ class CPUExpertsFp8(mk.FusedMoEExpertsModular):
     ) -> bool:
         SUPPORTED_W_A = [
             (kFp8Static128BlockSym, kFp8Dynamic128Sym),
+            # Refined blocks (see refine_fp8_moe_block_shape): the kernel takes
+            # the block shape as an argument; block_size_K must divide 128.
+            *(
+                (
+                    create_fp8_quant_key(
+                        static=True, group_shape=GroupShape(block, block)
+                    ),
+                    kFp8Dynamic128Sym,
+                )
+                for block in (32, 64)
+            ),
         ]
         return (weight_key, activation_key) in SUPPORTED_W_A
 
