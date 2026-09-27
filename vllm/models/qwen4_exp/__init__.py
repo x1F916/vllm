@@ -33,15 +33,11 @@ def __getattr__(name: str) -> Any:
                 "Qwen4Exp currently supports CUDA, ROCm, and x86 CPU only"
             )
         if current_platform.is_cpu():
-            if name == "Qwen4ExpMTP":
-                raise NotImplementedError(
-                    "Qwen4Exp MTP is not supported on CPU; run without "
-                    "speculative decoding."
-                )
             from .cpu.model import (
                 Qwen4ExpForCausalLM,
                 Qwen4ExpForConditionalGeneration,
             )
+            from .cpu.mtp import Qwen4ExpMTP
         elif current_platform.is_rocm():
             from .amd.model import (
                 Qwen4ExpForCausalLM,

@@ -582,6 +582,21 @@ class Qwen4ExpModel(nn.Module):
         else:
             self.hyper_connection_mixer = None
 
+        # The MTP drafter consumes the pre-final-mixer multi-stream state
+        # [T, hc_count*H] of the target on its first step.
+        spec_config = vllm_config.speculative_config
+        self._mtp_hidden_buffer: torch.Tensor | None = None
+        if (
+            spec_config is not None
+            and spec_config.method == "mtp"
+            and get_pp_group().is_last_rank
+        ):
+            self._mtp_hidden_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                config.hc_count * config.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+            )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -661,9 +676,11 @@ class Qwen4ExpModel(nn.Module):
         # the sampled single stream and the materialized multi-stream state.
         final_mixer = self.hyper_connection_mixer
         assert final_mixer is not None
-        _, sample_hidden_states, _ = final_mixer.combine_and_mix(
+        multi_hidden, sample_hidden_states, _ = final_mixer.combine_and_mix(
             hidden_states, block_output, injection
         )
+        if self._mtp_hidden_buffer is not None:
+            self._mtp_hidden_buffer[: multi_hidden.shape[0]].copy_(multi_hidden)
         return sample_hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -917,6 +934,9 @@ class Qwen4ExpForCausalLM(
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+        return self.model._mtp_hidden_buffer
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
@@ -1087,6 +1107,9 @@ class Qwen4ExpForConditionalGeneration(
         if deepstack_input_embeds is not None:
             self._set_deepstack_input_embeds(deepstack_input_embeds)
         return inputs_embeds
+
+    def get_mtp_target_hidden_states(self) -> torch.Tensor | None:
+        return self.language_model.get_mtp_target_hidden_states()
 
     def forward(
         self,

@@ -917,7 +917,13 @@ class Qwen4ExpMTPConfig(Qwen4ExpForConditionalGenerationConfig):
     @staticmethod
     def verify_and_update_config(vllm_config: "VllmConfig") -> None:
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
-        if hasattr(vllm_config.model_config.hf_config, "vision_config"):
+        from vllm.platforms import current_platform
+
+        # The CPU QSA path is text-only and supports 1D RoPE only.
+        if (
+            hasattr(vllm_config.model_config.hf_config, "vision_config")
+            and not current_platform.is_cpu()
+        ):
             return
         _strip_qwen4_exp_mrope(vllm_config.model_config)
 
