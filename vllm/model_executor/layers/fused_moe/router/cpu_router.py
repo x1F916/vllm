@@ -141,10 +141,13 @@ def _softmax_topk(
     renormalize: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     topk_logit_vals, topk_idx = torch.topk(router_logits, k=top_k, dim=-1, sorted=False)
+    # Normalize in fp32 like the other routing paths; bf16 logits would round
+    # the routing weights.
+    topk_logit_vals = topk_logit_vals.float()
     if renormalize:
         topk_vals = torch.softmax(topk_logit_vals, dim=-1)
     else:
-        logZ = torch.logsumexp(router_logits, dim=-1, keepdim=True)
+        logZ = torch.logsumexp(router_logits.float(), dim=-1, keepdim=True)
         topk_vals = (topk_logit_vals - logZ).exp()
     return topk_vals.to(torch.float32), topk_idx.to(torch.int32)
 
