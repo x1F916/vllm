@@ -365,7 +365,7 @@ void onednn_scaled_mm(
   TORCH_CHECK(c.is_contiguous());
   W8A8MatMulPrimitiveHandler* ptr =
       reinterpret_cast<W8A8MatMulPrimitiveHandler*>(
-          handler_tensor.item<int64_t>());
+          *handler_tensor.const_data_ptr<int64_t>());
   const int32_t* azp_ptr = nullptr;
   if (azp.has_value()) {
     azp_ptr = azp->data_ptr<int32_t>();
@@ -536,7 +536,8 @@ void onednn_mm(torch::Tensor& c,        // [M, OC], row-major
   TORCH_CHECK(a.stride(-1) == 1);
   TORCH_CHECK(c.stride(-1) == 1);
   MatMulPrimitiveHandler* ptr =
-      reinterpret_cast<MatMulPrimitiveHandler*>(handler_tensor.item<int64_t>());
+      reinterpret_cast<MatMulPrimitiveHandler*>(
+          *handler_tensor.const_data_ptr<int64_t>());
 
   torch::Tensor dnnl_output = c;
   // AArch64 specific case where we do a bf16 x bf16 -> fp32 matmul

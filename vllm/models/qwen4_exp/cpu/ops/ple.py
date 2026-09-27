@@ -11,6 +11,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.utils import NULL_BLOCK_ID
 
 from ..runtime import has_active_triton_cpu_backend
+from .launch import grid_num_threads, launch
 
 
 def _require_cpu_triton(*tensors: torch.Tensor) -> None:
@@ -162,7 +163,10 @@ def _ple_ngram_ids(
 
     block_tokens = 8
     if num_tokens:
-        _ple_ngram_ids_kernel[(triton.cdiv(num_tokens, block_tokens),)](
+        grid = (triton.cdiv(num_tokens, block_tokens),)
+        launch(
+            _ple_ngram_ids_kernel,
+            grid,
             input_ids,
             query_start_loc,
             ngram_context,
@@ -177,7 +181,7 @@ def _ple_ngram_ids(
             NGRAM_CONTEXT_LEN=context_len,
             HEADS_PER_NGRAM=heads_per_ngram,
             BLOCK_T=block_tokens,
-            num_cpu_threads=0,
+            num_cpu_threads=grid_num_threads(*grid),
         )
 
 
@@ -342,7 +346,10 @@ def _ple_gate(
     gated = torch.empty_like(hidden)
     normalized = torch.empty_like(hidden)
     if num_tokens:
-        _ple_gate_kernel[(num_tokens, hc_count)](
+        grid = (num_tokens, hc_count)
+        launch(
+            _ple_gate_kernel,
+            grid,
             key,
             value,
             hidden,
@@ -357,7 +364,7 @@ def _ple_gate(
             H=hidden_size,
             HC=hc_count,
             BLOCK_H=triton.next_power_of_2(hidden_size),
-            num_cpu_threads=0,
+            num_cpu_threads=grid_num_threads(*grid),
         )
     return gated, normalized
 
@@ -721,7 +728,10 @@ def _ple_conv(
     block_channels = min(256, triton.next_power_of_2(channels))
     token_map = token_indices if token_indices is not None else state_indices
     if token_count:
-        _ple_conv_kernel[(token_count, triton.cdiv(channels, block_channels))](
+        grid = (token_count, triton.cdiv(channels, block_channels))
+        launch(
+            _ple_conv_kernel,
+            grid,
             inputs,
             conv_state,
             conv_weights,
@@ -747,10 +757,13 @@ def _ple_conv(
             HAS_INIT=has_initial_states_arg,
             HAS_TOKEN_MAP=token_indices is not None,
             NULL_STATE_ID=NULL_BLOCK_ID,
-            num_cpu_threads=0,
+            num_cpu_threads=grid_num_threads(*grid),
         )
     if conv_mode != "decode" and num_reqs:
-        _ple_conv_writeback_kernel[(num_reqs, triton.cdiv(channels, block_channels))](
+        grid = (num_reqs, triton.cdiv(channels, block_channels))
+        launch(
+            _ple_conv_writeback_kernel,
+            grid,
             inputs,
             conv_state,
             state_indices,
@@ -771,7 +784,7 @@ def _ple_conv(
             HAS_INIT=has_initial_states_arg,
             HAS_TOKEN_MAP=token_indices is not None,
             NULL_STATE_ID=NULL_BLOCK_ID,
-            num_cpu_threads=0,
+            num_cpu_threads=grid_num_threads(*grid),
         )
 
 
