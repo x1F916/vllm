@@ -1017,14 +1017,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         out, _ = self.out_proj(core_attn_out)
         return out
 
+    def _cpu_input_projection(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the qkvz and ba projections; models may fuse the two GEMMs."""
+        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
+        return mixed_qkvz, ba
+
     def forward_cpu(
         self,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         assert not hasattr(self, "in_proj_qkv"), "lora isn't supported on CPU."
 
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        mixed_qkvz, ba = self._cpu_input_projection(hidden_states)
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout

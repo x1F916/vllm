@@ -412,6 +412,78 @@ def fuse_moe_input_projections(model: nn.Module, loaded: set[str]) -> set[str]:
     return loaded
 
 
+class Qwen4ExpGatedDeltaNet(QwenGatedDeltaNetAttention):
+    """Gated DeltaNet mixer that runs its qkvz and ba projections as one GEMM.
+
+    ``in_proj_ba`` is only 2 * num_v_heads / tp columns wide, so at decode
+    sizes its own GEMM costs mostly call overhead. Both projections read the
+    same input; concatenate their weights after loading instead.
+    """
+
+    def __init__(
+        self,
+        config: Qwen4ExpTextConfig,
+        vllm_config: VllmConfig,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            config,
+            vllm_config=vllm_config,
+            prefix=prefix,
+            gqa_interleaved_layout=False,
+        )
+        self.fused_in_proj: ReplicatedLinear | None = None
+        layers = (self.in_proj_qkvz, self.in_proj_ba)
+        if not self.disable_tp_for_ba_proj and all(
+            isinstance(layer.quant_method, UnquantizedLinearMethod) for layer in layers
+        ):
+            self._fused_in_sizes = [layer.output_size_per_partition for layer in layers]
+            self.fused_in_proj = ReplicatedLinear(
+                self.hidden_size,
+                sum(self._fused_in_sizes),
+                bias=False,
+                quant_config=None,
+                prefix=f"{prefix}.fused_in_proj",
+            )
+
+    def fuse_input_projections(self) -> None:
+        """Concatenate the loaded qkvz and ba weights into ``fused_in_proj``."""
+        if self.fused_in_proj is None:
+            return
+        layers = (self.in_proj_qkvz, self.in_proj_ba)
+        self.fused_in_proj.weight.data.copy_(
+            torch.cat([layer.weight.data for layer in layers], dim=0)
+        )
+        for layer in layers:
+            # Unused from now on; drop the storage and skip CPU GEMM packing.
+            layer.weight = nn.Parameter(
+                torch.empty_like(layer.weight, device="meta"), requires_grad=False
+            )
+            layer._cpu_skip_gemm_dispatch = True
+
+    def _cpu_input_projection(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.fused_in_proj is None:
+            return super()._cpu_input_projection(hidden_states)
+        fused, _ = self.fused_in_proj(hidden_states)
+        mixed_qkvz, ba = fused.split(self._fused_in_sizes, dim=-1)
+        return mixed_qkvz, ba
+
+
+def fuse_gdn_input_projections(model: nn.Module, loaded: set[str]) -> set[str]:
+    """Build every fused GDN input projection and mark it loaded."""
+    for name, module in model.named_modules():
+        if (
+            isinstance(module, Qwen4ExpGatedDeltaNet)
+            and module.fused_in_proj is not None
+        ):
+            module.fuse_input_projections()
+            loaded.add(f"{name}.fused_in_proj.weight")
+    return loaded
+
+
 class Qwen4ExpDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -449,11 +521,10 @@ class Qwen4ExpDecoderLayer(nn.Module):
             )
 
         if layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
+            self.linear_attn = Qwen4ExpGatedDeltaNet(
                 config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
-                gqa_interleaved_layout=False,
             )
         elif layer_type == "full_attention":
             use_qsa = getattr(config, "indexer_n_heads", None) is not None
@@ -833,7 +904,8 @@ class Qwen4ExpModel(nn.Module):
             weights,
             mapper=mapper,
         )
-        return fuse_moe_input_projections(self, loaded)
+        loaded = fuse_moe_input_projections(self, loaded)
+        return fuse_gdn_input_projections(self, loaded)
 
 
 class Qwen4ExpForCausalLM(
