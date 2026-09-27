@@ -171,7 +171,9 @@ def _cpu_gdn_attention_nonspec(
                     conv_state_indices=decode_state_indices,
                 )
 
-        query, key, value = layer.rearrange_mixed_qkv(decode_mixed_qkv)
+        query, key, value = (
+            x.unsqueeze(0) for x in _qkv_views(layer, decode_mixed_qkv)
+        )
 
         attn_out = ops.fused_sigmoid_gating_delta_rule_update_cpu(
             A_log=layer.A_log,
@@ -270,6 +272,57 @@ def _cpu_gdn_attention_nonspec(
 # state *after* draft token ``t`` lives in block-table column ``t``, so the
 # next step can resume from the slot of the last accepted token.
 # ---------------------------------------------------------------------------
+def _qkv_views(layer, mixed_qkv: torch.Tensor):
+    """Per-head q/k/v views of ``mixed_qkv`` [T, dim] without copies.
+
+    The CPU recurrent kernels take q/k/v row and head strides, so unlike
+    ``rearrange_mixed_qkv`` nothing has to be made contiguous.
+    """
+    num_tokens = mixed_qkv.size(0)
+    qk_dim = layer.key_dim // layer.tp_size
+    v_dim = layer.value_dim // layer.tp_size
+    query, key, value = mixed_qkv.split([qk_dim, qk_dim, v_dim], dim=-1)
+    return (
+        query.view(num_tokens, -1, layer.head_k_dim),
+        key.view(num_tokens, -1, layer.head_k_dim),
+        value.view(num_tokens, -1, layer.head_v_dim),
+    )
+
+
+def _spec_step_inputs(attn_metadata_i: GDNAttentionMetadata) -> tuple:
+    """Per-step int32 indices and the native-conv decision.
+
+    All GDN layers of a step share one metadata object, so this is computed
+    by the first layer and reused by the rest.
+    """
+    cached = attn_metadata_i.__dict__.get("_cpu_spec_step_inputs")
+    if cached is not None:
+        return cached
+    num_spec_decodes = attn_metadata_i.num_spec_decodes
+    spec_state_indices = attn_metadata_i.spec_state_indices_tensor
+    spec_qsl = attn_metadata_i.spec_query_start_loc
+    num_accepted = attn_metadata_i.num_accepted_tokens
+    assert spec_state_indices is not None
+    assert spec_qsl is not None
+    assert num_accepted is not None
+    cu = spec_qsl[: num_spec_decodes + 1].to(torch.int32).contiguous()
+    seq_lens = cu[1:] - cu[:-1]
+    uniform_len = 0
+    if num_spec_decodes > 0 and bool((seq_lens == seq_lens[0]).all()):
+        uniform_len = int(seq_lens[0])
+    spec_idx = spec_state_indices[:num_spec_decodes].to(torch.int32).contiguous()
+    cached = (
+        cu,
+        seq_lens,
+        spec_idx,
+        spec_idx[:, 0].contiguous(),
+        num_accepted[:num_spec_decodes].to(torch.int32).contiguous(),
+        uniform_len,
+    )
+    attn_metadata_i._cpu_spec_step_inputs = cached
+    return cached
+
+
 def _conv_buffer_view(layer) -> torch.Tensor:
     """Return the conv-state cache as (num_slots, dim, state_len)."""
     conv_cache = layer.kv_cache[0]
@@ -398,16 +451,10 @@ def _spec_forward(
     order as ``mixed_qkv_spec`` (i.e. ordered by ``spec_query_start_loc``).
     """
     num_spec_decodes = attn_metadata_i.num_spec_decodes
-    spec_state_indices = attn_metadata_i.spec_state_indices_tensor
-    spec_qsl = attn_metadata_i.spec_query_start_loc
-    num_accepted = attn_metadata_i.num_accepted_tokens
-    assert spec_state_indices is not None
-    assert spec_qsl is not None
-    assert num_accepted is not None
-
-    spec_qsl_cpu = spec_qsl[: num_spec_decodes + 1]
-    seq_starts = spec_qsl_cpu[:-1]
-    seq_lens = spec_qsl_cpu[1:] - spec_qsl_cpu[:-1]
+    cu, seq_lens, spec_idx, conv_idx, num_acc, uniform_len = _spec_step_inputs(
+        attn_metadata_i
+    )
+    seq_starts = cu[:-1]
 
     # ---- 1. Convolution (per-sequence rolling buffer) ----
     dim = mixed_qkv_spec.size(-1)
@@ -418,28 +465,23 @@ def _spec_forward(
         torch.cpu._is_amx_tile_supported()
         and not is_conv_state_dim_first()
         and width == 4
-        and num_spec_decodes > 0
-        and bool(torch.all(seq_lens == seq_lens[0]).item())
-        and int(seq_lens[0].item()) > 0
+        and uniform_len > 0
     )
     if can_use_native_conv:
-        q_i = int(seq_lens[0].item())
         conv_out = ops.causal_conv1d_update_cpu(
-            x=mixed_qkv_spec.view(num_spec_decodes, q_i, dim),
+            x=mixed_qkv_spec.view(num_spec_decodes, uniform_len, dim),
             conv_states=conv_buf,
             weight=layer.conv1d.weight,
             bias=bias,
             silu_activation=silu,
-            conv_state_indices=spec_state_indices[:num_spec_decodes, 0]
-            .to("cpu", torch.int32)
-            .contiguous(),
+            conv_state_indices=conv_idx,
             is_vnni=True,
-            num_accepted_tokens=num_accepted[:num_spec_decodes].to("cpu", torch.int32),
+            num_accepted_tokens=num_acc,
         ).view_as(mixed_qkv_spec)
     else:
         w = _unpacked_conv_weight(layer).unsqueeze(1)
-        col0 = spec_state_indices[:num_spec_decodes, 0]
-        num_acc_cpu = num_accepted[:num_spec_decodes]
+        col0 = conv_idx
+        num_acc_cpu = num_acc
         conv_out = torch.empty_like(mixed_qkv_spec)
         for i in range(num_spec_decodes):
             q_i = int(seq_lens[i].item())
@@ -466,13 +508,7 @@ def _spec_forward(
     # Single fused kernel call: it runs the recurrence over each sequence's
     # draft tokens internally, resumes from slot ``num_accepted-1`` and stores
     # the state after token ``t`` into slot ``t`` (rollback for the next step).
-    query, key, value = layer.rearrange_mixed_qkv(conv_out)
-    query = query.squeeze(0)
-    key = key.squeeze(0)
-    value = value.squeeze(0)
-    spec_idx = spec_state_indices[:num_spec_decodes].to(torch.int32).contiguous()
-    num_acc = num_accepted[:num_spec_decodes].to(torch.int32).contiguous()
-    cu = spec_qsl[: num_spec_decodes + 1].to(torch.int32).contiguous()
+    query, key, value = _qkv_views(layer, conv_out)
     out_spec = ops.fused_sigmoid_gating_delta_rule_update_spec_cpu(
         A_log=layer.A_log,
         dt_bias=layer.dt_bias,

@@ -663,12 +663,16 @@ def test_spec_forward_prepares_native_conv_metadata(
         conv1d=types.SimpleNamespace(weight=torch.empty(1, CONV_KERNEL), bias=None),
         A_log=None,
         dt_bias=None,
-        rearrange_mixed_qkv=lambda x: (x.unsqueeze(0),) * 3,
+        key_dim=1,
+        value_dim=1,
+        tp_size=1,
+        head_k_dim=1,
+        head_v_dim=1,
     )
     gdn_attention._spec_forward(
         layer=layer,
         attn_metadata_i=metadata,
-        mixed_qkv_spec=torch.zeros(8, 1, dtype=torch.bfloat16),
+        mixed_qkv_spec=torch.zeros(8, 3, dtype=torch.bfloat16),
         b_spec=torch.empty(0),
         a_spec=torch.empty(0),
         conv_buf=torch.empty(0),
